@@ -147,9 +147,25 @@ async def check_rss_feeds():
         logging.info("First run complete. Posted initial tweets. Listening for new updates...")
         is_first_run = False
 
+async def start_health_check_server():
+    """Start a lightweight HTTP server to satisfy Render Web Service port scanning."""
+    port = os.getenv("PORT")
+    if not port:
+        return
+    
+    app = aiohttp.web.Application()
+    app.router.add_get("/", lambda req: aiohttp.web.Response(text="Bot is running!"))
+    app.router.add_get("/health", lambda req: aiohttp.web.Response(text="OK"))
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "0.0.0.0", int(port))
+    await site.start()
+    logging.info(f"Health check HTTP server started on port {port}")
+
 @bot.event
 async def on_ready():
     logging.info(f"Logged in securely as {bot.user.name} (ID: {bot.user.id})")
+    await start_health_check_server()
     if not check_rss_feeds.is_running():
         check_rss_feeds.start()
 
@@ -158,3 +174,4 @@ if __name__ == "__main__":
         logging.error("Please set a valid DISCORD_TOKEN in your .env file.")
     else:
         bot.run(TOKEN)
+

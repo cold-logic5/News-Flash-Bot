@@ -4,10 +4,12 @@ import json
 import asyncio
 import logging
 import aiohttp
+from aiohttp import web
 import feedparser
 import discord
 from discord.ext import tasks, commands
 from dotenv import load_dotenv
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -153,14 +155,15 @@ async def start_health_check_server():
     if not port:
         return
     
-    app = aiohttp.web.Application()
-    app.router.add_get("/", lambda req: aiohttp.web.Response(text="Bot is running!"))
-    app.router.add_get("/health", lambda req: aiohttp.web.Response(text="OK"))
-    runner = aiohttp.web.AppRunner(app)
+    app = web.Application()
+    app.router.add_get("/", lambda req: web.Response(text="Bot is running!"))
+    app.router.add_get("/health", lambda req: web.Response(text="OK"))
+    runner = web.AppRunner(app)
     await runner.setup()
-    site = aiohttp.web.TCPSite(runner, "0.0.0.0", int(port))
+    site = web.TCPSite(runner, "0.0.0.0", int(port))
     await site.start()
     logging.info(f"Health check HTTP server started on port {port}")
+
 
 @bot.event
 async def on_ready():

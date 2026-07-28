@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import asyncio
 import logging
 import aiohttp
@@ -18,12 +19,14 @@ ACCOUNTS_STR = os.getenv("ACCOUNTS", "sunnewstamil,News18TamilNadu,polimernews,N
 ACCOUNTS = [acc.strip() for acc in ACCOUNTS_STR.split(",") if acc.strip()]
 
 CACHE_FILE = "posted_tweets.json"
+MAX_CACHE_SIZE = 500  # Store up to 500 recent IDs to avoid re-posting
+MAX_AGE_SECONDS = 3 * 3600  # Ignore tweets older than 3 hours
 
 # Working RSS / Nitter mirrors with fallback support
 RSS_INSTANCES = [
     "https://nitter.net",
-    "https://xcancel.com",
     "https://nitter.poast.org",
+    "https://xcancel.com",
 ]
 
 def load_posted_urls() -> set:
@@ -37,17 +40,17 @@ def load_posted_urls() -> set:
     return set()
 
 def save_posted_urls(posted_urls: set):
-    """Save seen tweet IDs to local JSON file, keeping max 50 items."""
+    """Save seen tweet IDs to local JSON file, keeping max MAX_CACHE_SIZE items."""
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(posted_urls)[-50:], f, indent=2)
+            json.dump(list(posted_urls)[-MAX_CACHE_SIZE:], f, indent=2)
     except Exception as e:
         logging.error(f"Error saving cache file: {e}")
 
 async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
     """Asynchronously fetch RSS feed trying mirrors until a valid feed is returned."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/rss+xml, application/xml, text/xml, */*"
     }
     
@@ -92,17 +95,21 @@ async def main():
 
     posted_urls = load_posted_urls()
     is_first_run = len(posted_urls) == 0
+    now = time.time()
+
+    all_unposted_tweets = []
 
     async with aiohttp.ClientSession() as session:
+        # Step 1: Collect unposted tweets across ALL accounts into a single pool
         for account in ACCOUNTS:
             feed = await fetch_working_feed(session, account)
             if not feed or not feed.entries:
                 continue
             
-            # On first run, process only the single newest tweet per account
-            entries_to_check = [feed.entries[0]] if is_first_run else reversed(feed.entries)
+            # If first run ever, only consider the newest tweet for each account
+            entries_to_inspect = [feed.entries[0]] if is_first_run else feed.entries
             
-            for entry in entries_to_check:
+            for entry in entries_to_inspect:
                 raw_link = getattr(entry, "link", "")
                 
                 # Extract numeric Tweet Status ID (/status/123456789)
@@ -115,18 +122,48 @@ async def main():
                 
                 if unique_key in posted_urls:
                     continue
-                
-                posted_urls.add(unique_key)
-                
-                # Format URL using fxtwitter for rich Discord media embeds
-                fxtwitter_url = f"https://fxtwitter.com/{account}/status/{tweet_id}"
-                message = f"📰 **New update from @{account}**\n{fxtwitter_url}"
-                
-                success = await send_discord_webhook(session, WEBHOOK_URL, message)
-                if success:
-                    await asyncio.sleep(1.5)  # Rate limit protection
+
+                # Parse published timestamp
+                published_parsed = entry.get("published_parsed")
+                published_ts = time.mktime(published_parsed) if published_parsed else now
+
+                # Skip tweets older than MAX_AGE_SECONDS (e.g. 3 hours) except on initial first run
+                if not is_first_run and (now - published_ts > MAX_AGE_SECONDS):
+                    logging.info(f"Skipping older tweet {unique_key} (published > 3h ago)")
+                    continue
+
+                all_unposted_tweets.append({
+                    "account": account,
+                    "tweet_id": tweet_id,
+                    "unique_key": unique_key,
+                    "published_ts": published_ts
+                })
             
-            await asyncio.sleep(2)  # Delay between account processing
+            await asyncio.sleep(1)  # Brief delay between account fetches
+
+        if not all_unposted_tweets:
+            logging.info("No new tweets to post.")
+            save_posted_urls(posted_urls)
+            return
+
+        # Step 2: Sort ALL unposted tweets across all accounts chronologically (oldest first)
+        all_unposted_tweets.sort(key=lambda item: item["published_ts"])
+
+        logging.info(f"Found {len(all_unposted_tweets)} new tweets across all accounts. Posting in chronological order...")
+
+        # Step 3: Post tweets to Discord in exact chronological sequence
+        for tweet_info in all_unposted_tweets:
+            account = tweet_info["account"]
+            tweet_id = tweet_info["tweet_id"]
+            unique_key = tweet_info["unique_key"]
+
+            fxtwitter_url = f"https://fxtwitter.com/{account}/status/{tweet_id}"
+            message = f"📰 **New update from @{account}**\n{fxtwitter_url}"
+            
+            success = await send_discord_webhook(session, WEBHOOK_URL, message)
+            if success:
+                posted_urls.add(unique_key)
+                await asyncio.sleep(1.5)  # Rate limit protection between webhooks
 
     save_posted_urls(posted_urls)
     logging.info("RSS Feed Monitor execution finished successfully.")

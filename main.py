@@ -100,9 +100,11 @@ async def main():
     all_unposted_tweets = []
 
     async with aiohttp.ClientSession() as session:
-        # Step 1: Collect unposted tweets across ALL accounts into a single pool
-        for account in ACCOUNTS:
-            feed = await fetch_working_feed(session, account)
+        # Step 1: FETCH (In parallel using asyncio.gather)
+        tasks = [fetch_working_feed(session, account) for account in ACCOUNTS]
+        feeds = await asyncio.gather(*tasks)
+
+        for account, feed in zip(ACCOUNTS, feeds):
             if not feed or not feed.entries:
                 continue
             
@@ -138,8 +140,6 @@ async def main():
                     "unique_key": unique_key,
                     "published_ts": published_ts
                 })
-            
-            await asyncio.sleep(1)  # Brief delay between account fetches
 
         if not all_unposted_tweets:
             logging.info("No new tweets to post.")

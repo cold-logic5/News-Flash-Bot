@@ -2,9 +2,10 @@ name: RSS Feed Monitor
 
 on:
   schedule:
-    # Runs every 10 minutes
-    - cron: '*/10 * * * *'
+    # Runs every 5 minutes (fastest GitHub schedule)
+    - cron: '*/5 * * * *'
   workflow_dispatch: # Allows manual trigger anytime from GitHub Actions tab
+
 
 permissions:
   contents: write

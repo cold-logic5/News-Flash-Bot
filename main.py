@@ -24,8 +24,9 @@ MAX_AGE_SECONDS = 3 * 3600  # Ignore tweets older than 3 hours
 
 # Working RSS / Nitter mirrors with fallback support
 RSS_INSTANCES = [
+    "https://nitter.perennialte.ch",
+    "https://nitter.privacydev.net",
     "https://nitter.net",
-    "https://nitter.poast.org",
     "https://xcancel.com",
 ]
 

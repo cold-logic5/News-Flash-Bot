@@ -9,6 +9,7 @@ import logging
 import base64
 from typing import Optional, Set, Tuple
 import aiohttp
+from aiohttp import web
 import feedparser
 from dotenv import load_dotenv
 
@@ -25,6 +26,12 @@ ACCOUNTS = [acc.strip() for acc in ACCOUNTS_STR.split(",") if acc.strip()]
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "cold-logic5/News-Flash-Bot")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "master")
+
+PORT = os.getenv("PORT")
+CRON_SECRET = os.getenv("CRON_SECRET")
+
+# Concurrency lock to prevent simultaneous overlapping runs
+run_lock = asyncio.Lock()
 
 CACHE_FILE = "posted_tweets.json"
 MAX_CACHE_SIZE = 500  # Store up to 500 recent IDs to avoid re-posting
@@ -260,55 +267,134 @@ async def send_discord_webhook(session: aiohttp.ClientSession, webhook_url: str,
         logging.error(f"Error posting to Discord Webhook: {e}")
         return False
 
-async def main():
+async def run_feed_check() -> dict:
+    """Core logic to check accounts, dispatch new tweets to Discord, and persist cache."""
     if not WEBHOOK_URL or WEBHOOK_URL == "YOUR_DISCORD_WEBHOOK_URL_HERE":
         logging.error("DISCORD_WEBHOOK_URL environment variable is missing or invalid.")
-        sys.exit(1)
+        return {"status": "error", "message": "DISCORD_WEBHOOK_URL missing or invalid"}
 
+    start_time = time.time()
     now = time.time()
     all_unposted_tweets = []
 
-    async with aiohttp.ClientSession() as session:
-        posted_urls, file_sha = await load_posted_urls(session)
-        is_first_run = len(posted_urls) == 0
+    try:
+        async with aiohttp.ClientSession() as session:
+            posted_urls, file_sha = await load_posted_urls(session)
+            is_first_run = len(posted_urls) == 0
 
-        # Step 1: FETCH (In parallel using asyncio.gather)
-        tasks = [fetch_tweets_for_account(session, account, posted_urls, is_first_run, now) for account in ACCOUNTS]
-        results = await asyncio.gather(*tasks)
+            # Step 1: FETCH (In parallel using asyncio.gather)
+            tasks = [fetch_tweets_for_account(session, account, posted_urls, is_first_run, now) for account in ACCOUNTS]
+            results = await asyncio.gather(*tasks)
 
-        for account_tweets in results:
-            all_unposted_tweets.extend(account_tweets)
+            for account_tweets in results:
+                all_unposted_tweets.extend(account_tweets)
 
-        if not all_unposted_tweets:
-            logging.info("No new tweets to post.")
-            return
+            if not all_unposted_tweets:
+                logging.info("No new tweets to post.")
+                return {
+                    "status": "ok",
+                    "new_tweets": 0,
+                    "accounts_checked": len(ACCOUNTS),
+                    "duration_seconds": round(time.time() - start_time, 2)
+                }
 
-        # Step 2: Sort ALL unposted tweets across all accounts chronologically (oldest first)
-        all_unposted_tweets.sort(key=lambda item: item["published_ts"])
+            # Step 2: Sort ALL unposted tweets across all accounts chronologically (oldest first)
+            all_unposted_tweets.sort(key=lambda item: item["published_ts"])
 
-        logging.info(f"Found {len(all_unposted_tweets)} new tweets across all accounts. Posting in chronological order...")
+            logging.info(f"Found {len(all_unposted_tweets)} new tweets across all accounts. Posting in chronological order...")
 
-        # Step 3: Post tweets to Discord in exact chronological sequence
-        newly_posted = 0
-        for tweet_info in all_unposted_tweets:
-            account = tweet_info["account"]
-            tweet_id = tweet_info["tweet_id"]
-            unique_key = tweet_info["unique_key"]
+            # Step 3: Post tweets to Discord in exact chronological sequence
+            newly_posted = 0
+            for tweet_info in all_unposted_tweets:
+                account = tweet_info["account"]
+                tweet_id = tweet_info["tweet_id"]
+                unique_key = tweet_info["unique_key"]
 
-            fxtwitter_url = f"https://fxtwitter.com/{account}/status/{tweet_id}"
-            message = f"📰 **New update from @{account}**\n{fxtwitter_url}"
-            
-            success = await send_discord_webhook(session, WEBHOOK_URL, message)
-            if success:
-                posted_urls.add(unique_key)
-                newly_posted += 1
-                await asyncio.sleep(1.5)  # Rate limit protection between webhooks
+                fxtwitter_url = f"https://fxtwitter.com/{account}/status/{tweet_id}"
+                message = f"📰 **New update from @{account}**\n{fxtwitter_url}"
+                
+                success = await send_discord_webhook(session, WEBHOOK_URL, message)
+                if success:
+                    posted_urls.add(unique_key)
+                    newly_posted += 1
+                    await asyncio.sleep(1.5)  # Rate limit protection between webhooks
 
-        if newly_posted > 0:
-            await save_posted_urls(session, posted_urls, file_sha)
-            
-    logging.info("Feed Monitor execution finished successfully.")
+            if newly_posted > 0:
+                await save_posted_urls(session, posted_urls, file_sha)
+                
+        duration = round(time.time() - start_time, 2)
+        logging.info(f"Feed Monitor execution finished successfully in {duration}s.")
+        return {
+            "status": "ok",
+            "new_tweets": newly_posted,
+            "total_candidates": len(all_unposted_tweets),
+            "duration_seconds": duration
+        }
+    except Exception as e:
+        logging.exception(f"Error executing feed monitor: {e}")
+        return {"status": "error", "message": str(e)}
+
+async def handle_root(request: web.Request) -> web.Response:
+    """Health check / information page."""
+    html_content = (
+        "<html><head><title>Tamil News Bot</title></head>"
+        "<body style='font-family: sans-serif; text-align: center; padding: 50px;'>"
+        "<h1>📰 Tamil News Bot Webhook Service</h1>"
+        "<p>Service is active and healthy.</p>"
+        "<p>Send a GET or POST request to <code>/run</code> to trigger a feed check.</p>"
+        "</body></html>"
+    )
+    return web.Response(text=html_content, content_type="text/html")
+
+async def handle_healthz(request: web.Request) -> web.Response:
+    """Standard health check endpoint for monitoring."""
+    return web.Response(text="OK", status=200)
+
+async def handle_run(request: web.Request) -> web.Response:
+    """Webhook endpoint triggered by cron-job.org or manual ping."""
+    # Optional authorization via secret token
+    if CRON_SECRET:
+        auth_header = request.headers.get("Authorization", "")
+        token_param = request.query.get("token", "")
+        expected_header = f"Bearer {CRON_SECRET}"
+        if auth_header != expected_header and token_param != CRON_SECRET:
+            return web.json_response(
+                {"status": "unauthorized", "message": "Invalid or missing token."},
+                status=401
+            )
+
+    # Concurrency control: prevent simultaneous overlapping executions
+    if run_lock.locked():
+        return web.json_response(
+            {"status": "busy", "message": "A feed check is currently in progress."},
+            status=429
+        )
+
+    async with run_lock:
+        result = await run_feed_check()
+        status_code = 200 if result.get("status") == "ok" else 500
+        return web.json_response(result, status=status_code)
+
+def create_app() -> web.Application:
+    """Create and configure the aiohttp web application."""
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/healthz", handle_healthz)
+    app.router.add_get("/run", handle_run)
+    app.router.add_post("/run", handle_run)
+    return app
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    is_cli = "--cli" in sys.argv or (not PORT and "--server" not in sys.argv)
+    if is_cli:
+        logging.info("Running in CLI mode...")
+        result = asyncio.run(run_feed_check())
+        if result.get("status") == "error":
+            sys.exit(1)
+    else:
+        server_port = int(PORT) if PORT else 8080
+        logging.info(f"Starting Web Service on port {server_port} for cron-job.org triggers...")
+        app = create_app()
+        web.run_app(app, host="0.0.0.0", port=server_port)
+
 

@@ -1,8 +1,8 @@
 services:
-  - type: cron
+  - type: web
     name: tamil-news-bot
     runtime: python
-    schedule: "*/5 * * * *"
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
@@ -17,4 +17,6 @@ services:
       - key: GITHUB_BRANCH
         value: master
       - key: GITHUB_TOKEN
+        sync: false
+      - key: CRON_SECRET
         sync: false

@@ -1,19 +1,19 @@
-# X (Twitter) RSS Feed Discord Monitor (Webhook Edition)
+# X (Twitter) RSS Feed Discord Monitor (Webhook + cron-job.org Edition)
 
-This lightweight bot monitors Tamil news X (Twitter) accounts and dispatches updates directly to a **Discord Webhook** using `fxtwitter.com` links for rich media embeds (videos, images, text).
-
----
-
-## ⚡ Why Webhooks & Render?
-
-- **No Bot Tokens or Gateway required**: Uses native HTTP POST requests.
-- **Reliable Datacenter IPs**: Render Cron Job instances are far less likely to be blocked by X/Twitter compared to GitHub Actions runner IP pools.
-- **Cache Persistence**: Automatically reads and commits `posted_tweets.json` back to your GitHub repository using the GitHub API so deduplication persists across ephemeral Render containers.
-- **100% Free**: Operates comfortably within the free tier.
+This lightweight bot monitors Tamil news accounts on X (Twitter) and dispatches updates directly to a **Discord Webhook** using `fxtwitter.com` links for rich media embeds (videos, images, text).
 
 ---
 
-## 🚀 Setup Instructions
+## ⚡ Why Render Web Service + cron-job.org?
+
+- **100% Free**: Operates entirely within Render's Free Web Service tier (750 free hours/month) and cron-job.org's free plan.
+- **Never Goes to Sleep**: Free Render web services normally spin down after 15 minutes of inactivity. Since **cron-job.org pings it every 5 minutes**, the service **stays warm 24/7**!
+- **Reliable Datacenter IPs**: Unlike GitHub Actions datacenter IP pools (which X/Twitter aggressively blocks), Render's IPs reliably fetch updates.
+- **Cache Persistence**: Automatically syncs `posted_tweets.json` with your GitHub repository via the GitHub Contents API so deduplication survives container restarts.
+
+---
+
+## 🚀 Setup Guide
 
 ### Step 1: Create a Discord Webhook
 1. Open your Discord server.
@@ -23,67 +23,81 @@ This lightweight bot monitors Tamil news X (Twitter) accounts and dispatches upd
 ---
 
 ### Step 2: Create a GitHub Personal Access Token (PAT)
-To allow Render to save posted tweet history back to this repository:
-1. On GitHub, go to **Settings** ➔ **Developer settings** ➔ **Personal access tokens** ➔ **Fine-grained tokens** (or Tokens classic).
+To allow the service to save seen tweet IDs back to this repository:
+1. On GitHub, go to: **Settings** ➔ **Developer settings** ➔ **Personal access tokens** ➔ **Fine-grained tokens** (or [click here](https://github.com/settings/tokens?type=beta)).
 2. Click **Generate new token**:
    - **Token name**: `Render News Bot Cache`
-   - **Repository access**: Only select `cold-logic5/News-Flash-Bot`
-   - **Permissions**:
-     - **Contents**: `Read and write`
-3. Generate the token and copy the value (`github_pat_...` or `ghp_...`).
+   - **Repository access**: Select `Only select repositories` ➔ choose `News-Flash-Bot`.
+   - **Repository permissions**: Under **Contents**, set to `Read and write`.
+3. Click **Generate token** and copy the value (`github_pat_...`).
 
 ---
 
-### Step 3: Deploy to Render (Primary - Recommended)
+### Step 3: Deploy to Render (Free Web Service)
 
-#### Option A: Using Render Blueprints (Automatic Setup)
-1. Log in to [Render Dashboard](https://dashboard.render.com).
+#### Option A: Using Render Blueprints (Automatic)
+1. Go to your [Render Dashboard](https://dashboard.render.com).
 2. Click **Blueprints** ➔ **New Blueprint Instance**.
-3. Connect your repository (`News-Flash-Bot`).
-4. Render will read `render.yaml` and configure the Cron Job (`tamil-news-bot`).
-5. Provide the two required environment variables when prompted:
-   - `DISCORD_WEBHOOK_URL`: Your Discord webhook URL
-   - `GITHUB_TOKEN`: Your GitHub Personal Access Token generated in Step 2
-6. Click **Apply**. Render will run the bot every 5 minutes (`*/5 * * * *`).
+3. Connect your repository `cold-logic5/News-Flash-Bot` (`master` branch).
+4. Render will read `render.yaml` and configure the web service.
+5. Provide the environment variables when prompted:
+   - `DISCORD_WEBHOOK_URL`: Your Discord Webhook URL
+   - `GITHUB_TOKEN`: The GitHub PAT created in Step 2
+   - `CRON_SECRET`: *(Optional)* A secret password to protect your `/run` endpoint
+6. Click **Apply**. Once deployed, copy your service URL (e.g., `https://tamil-news-bot-xxxx.onrender.com`).
 
-#### Option B: Manual Setup on Render
-1. In Render Dashboard, click **New +** ➔ **Cron Job**.
-2. Connect your `News-Flash-Bot` repository.
-3. Configure the job:
+#### Option B: Manual Web Service Setup
+1. In Render Dashboard, click **New +** ➔ **Web Service**.
+2. Connect your repository `cold-logic5/News-Flash-Bot`.
+3. Fill in:
    - **Name**: `tamil-news-bot`
-   - **Schedule**: `*/5 * * * *`
-   - **Runtime**: `Python`
+   - **Language / Runtime**: `Python`
+   - **Branch**: `master`
+   - **Plan**: `Free`
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `python main.py`
-4. In the **Environment Variables** section, add:
+4. In **Environment Variables**, add:
    - `DISCORD_WEBHOOK_URL`: `<your-discord-webhook-url>`
    - `ACCOUNTS`: `sunnewstamil,News18TamilNadu,polimernews`
    - `GITHUB_REPO`: `cold-logic5/News-Flash-Bot`
    - `GITHUB_BRANCH`: `master`
    - `GITHUB_TOKEN`: `<your-github-pat>`
-5. Click **Create Cron Job**.
+   - `CRON_SECRET`: *(Optional)* `<a-secret-passphrase>`
+5. Click **Create Web Service**. Copy your live URL when ready.
 
 ---
 
-### Step 4: GitHub Actions (Backup Runner)
+### Step 4: Configure cron-job.org
 
-The repository retains `.github/workflows/rss_monitor.yml` as an automated backup.
-If Render is active, you can keep GitHub Actions running as a fallback or disable it in GitHub ➔ **Actions** tab if you only want Render to execute.
+1. Register or log in to [cron-job.org](https://cron-job.org).
+2. Go to **Cronjobs** ➔ click **Create cronjob**.
+3. Configure the settings:
+   - **Title**: `Tamil News Bot Trigger`
+   - **URL**: `https://<your-service-name>.onrender.com/run`
+     *(If you set a `CRON_SECRET`, use: `https://<your-service-name>.onrender.com/run?token=YOUR_CRON_SECRET`)*
+   - **Execution schedule**: Choose `Every 5 minutes` (or `User-defined: */5 * * * *`).
+   - **Request method**: `GET`
+4. Under **Advanced settings**:
+   - **Request timeout**: `30 seconds`
+5. Click **Create**.
+
+Your bot is now live! Every 5 minutes, cron-job.org pings `/run`, checking all tracked accounts, posting new tweets to Discord, updating the cache on GitHub, and keeping Render awake!
 
 ---
 
 ## 🛠 Local Testing
 
-Create a `.env` file based on `.env.example`:
-```env
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-ACCOUNTS=sunnewstamil,News18TamilNadu,polimernews
-GITHUB_REPO=cold-logic5/News-Flash-Bot
-GITHUB_BRANCH=master
-GITHUB_TOKEN=ghp_... # optional for local testing
+### Standalone CLI Mode
+Run once directly without starting a server:
+```bash
+python main.py --cli
 ```
 
-Run locally:
+### Local Web Server Mode
+Test the web server on port 8080:
 ```bash
-python main.py
+python main.py --server
 ```
+Then in your browser or terminal:
+- Health check: `http://localhost:8080/`
+- Trigger feed check: `http://localhost:8080/run`

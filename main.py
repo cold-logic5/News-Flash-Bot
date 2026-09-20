@@ -50,13 +50,55 @@ def save_posted_urls(posted_urls: set):
     except Exception as e:
         logging.error(f"Error saving cache file: {e}")
 
-async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
-    """Asynchronously fetch RSS feed trying mirrors until a valid feed is returned."""
+async def fetch_tweets_for_account(
+    session: aiohttp.ClientSession,
+    account: str,
+    posted_urls: set,
+    is_first_run: bool,
+    now: float
+) -> list:
+    """Fetch recent tweets for an account using direct X.com HTML scraping with Nitter RSS as fallback."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/rss+xml, application/xml, text/xml, */*"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     
+    # Strategy 1: Direct X.com / Twitter.com scraping
+    for domain in ["https://x.com", "https://twitter.com"]:
+        url = f"{domain}/{account}"
+        try:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    pattern = rf"/{account}/status/(\d+)"
+                    matches = list(dict.fromkeys(re.findall(pattern, html, re.IGNORECASE)))
+                    if matches:
+                        candidates = [matches[0]] if is_first_run else matches
+                        found = []
+                        for tweet_id in candidates:
+                            unique_key = f"{account}_{tweet_id}"
+                            if unique_key in posted_urls:
+                                continue
+                            try:
+                                # Twitter Snowflake ID encodes UTC timestamp in milliseconds
+                                published_ts = ((int(tweet_id) >> 22) + 1288834974657) / 1000.0
+                            except ValueError:
+                                continue
+                            if not is_first_run and (now - published_ts > MAX_AGE_SECONDS):
+                                continue
+                            found.append({
+                                "account": account,
+                                "tweet_id": tweet_id,
+                                "unique_key": unique_key,
+                                "published_ts": published_ts
+                            })
+                        logging.info(f"Successfully scraped {len(found)} candidate tweets for @{account} from {domain}")
+                        return found
+        except Exception as e:
+            logging.debug(f"Direct scrape from {domain} for @{account} failed: {e}")
+
+    # Strategy 2: Nitter RSS fallback
     for instance in RSS_INSTANCES:
         feed_url = f"{instance}/{account}/rss"
         try:
@@ -65,15 +107,35 @@ async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
                     content = await response.text()
                     feed = await asyncio.to_thread(feedparser.parse, content)
                     title = str(feed.feed.get("title", ""))
-                    
                     if feed.entries and "whitelisted" not in title.lower():
-                        logging.info(f"Successfully fetched feed for @{account} from {instance}")
-                        return feed
+                        entries_to_inspect = [feed.entries[0]] if is_first_run else feed.entries
+                        found = []
+                        for entry in entries_to_inspect:
+                            raw_link = getattr(entry, "link", "")
+                            match = re.search(r"/status/(\d+)", raw_link)
+                            if not match:
+                                continue
+                            tweet_id = match.group(1)
+                            unique_key = f"{account}_{tweet_id}"
+                            if unique_key in posted_urls:
+                                continue
+                            published_parsed = entry.get("published_parsed")
+                            published_ts = calendar.timegm(published_parsed) if published_parsed else now
+                            if not is_first_run and (now - published_ts > MAX_AGE_SECONDS):
+                                continue
+                            found.append({
+                                "account": account,
+                                "tweet_id": tweet_id,
+                                "unique_key": unique_key,
+                                "published_ts": published_ts
+                            })
+                        logging.info(f"Successfully fetched {len(found)} candidate tweets for @{account} from {instance}")
+                        return found
         except Exception as e:
-            logging.debug(f"Error fetching from {instance} for @{account}: {e}")
-            
-    logging.warning(f"Could not fetch valid RSS feed for @{account} from any instance.")
-    return None
+            logging.debug(f"RSS mirror {instance} failed for @{account}: {e}")
+
+    logging.warning(f"Could not fetch valid tweets for @{account} from any source.")
+    return []
 
 async def send_discord_webhook(session: aiohttp.ClientSession, webhook_url: str, message_content: str) -> bool:
     """Send HTTP POST request to Discord Webhook URL."""
@@ -104,45 +166,11 @@ async def main():
 
     async with aiohttp.ClientSession() as session:
         # Step 1: FETCH (In parallel using asyncio.gather)
-        tasks = [fetch_working_feed(session, account) for account in ACCOUNTS]
-        feeds = await asyncio.gather(*tasks)
+        tasks = [fetch_tweets_for_account(session, account, posted_urls, is_first_run, now) for account in ACCOUNTS]
+        results = await asyncio.gather(*tasks)
 
-        for account, feed in zip(ACCOUNTS, feeds):
-            if not feed or not feed.entries:
-                continue
-            
-            # If first run ever, only consider the newest tweet for each account
-            entries_to_inspect = [feed.entries[0]] if is_first_run else feed.entries
-            
-            for entry in entries_to_inspect:
-                raw_link = getattr(entry, "link", "")
-                
-                # Extract numeric Tweet Status ID (/status/123456789)
-                match = re.search(r"/status/(\d+)", raw_link)
-                if not match:
-                    continue
-                
-                tweet_id = match.group(1)
-                unique_key = f"{account}_{tweet_id}"
-                
-                if unique_key in posted_urls:
-                    continue
-
-                # Parse published timestamp (UTC struct_time -> UTC timestamp)
-                published_parsed = entry.get("published_parsed")
-                published_ts = calendar.timegm(published_parsed) if published_parsed else now
-
-                # Skip tweets older than MAX_AGE_SECONDS (e.g. 3 hours) except on initial first run
-                if not is_first_run and (now - published_ts > MAX_AGE_SECONDS):
-                    logging.info(f"Skipping older tweet {unique_key} (published > 3h ago)")
-                    continue
-
-                all_unposted_tweets.append({
-                    "account": account,
-                    "tweet_id": tweet_id,
-                    "unique_key": unique_key,
-                    "published_ts": published_ts
-                })
+        for account_tweets in results:
+            all_unposted_tweets.extend(account_tweets)
 
         if not all_unposted_tweets:
             logging.info("No new tweets to post.")

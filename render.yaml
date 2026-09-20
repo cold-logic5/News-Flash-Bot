@@ -1,0 +1,20 @@
+services:
+  - type: cron
+    name: tamil-news-bot
+    runtime: python
+    schedule: "*/5 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: ACCOUNTS
+        value: sunnewstamil,News18TamilNadu,polimernews
+      - key: GITHUB_REPO
+        value: cold-logic5/News-Flash-Bot
+      - key: GITHUB_BRANCH
+        value: master
+      - key: GITHUB_TOKEN
+        sync: false

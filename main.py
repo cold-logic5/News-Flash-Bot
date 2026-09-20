@@ -6,6 +6,8 @@ import time
 import calendar
 import asyncio
 import logging
+import base64
+from typing import Optional, Set, Tuple
 import aiohttp
 import feedparser
 from dotenv import load_dotenv
@@ -20,6 +22,10 @@ WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 ACCOUNTS_STR = os.getenv("ACCOUNTS", "sunnewstamil,News18TamilNadu,polimernews")
 ACCOUNTS = [acc.strip() for acc in ACCOUNTS_STR.split(",") if acc.strip()]
 
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "cold-logic5/News-Flash-Bot")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "master")
+
 CACHE_FILE = "posted_tweets.json"
 MAX_CACHE_SIZE = 500  # Store up to 500 recent IDs to avoid re-posting
 MAX_AGE_SECONDS = 3 * 3600  # Ignore tweets older than 3 hours
@@ -31,24 +37,117 @@ RSS_INSTANCES = [
     "https://nitter.poast.org",
 ]
 
-def load_posted_urls() -> set:
-    """Load cached tweet IDs from local JSON file."""
+async def load_posted_urls(session: aiohttp.ClientSession) -> Tuple[Set[str], Optional[str]]:
+    """Load cached tweet IDs from GitHub API if configured, with local JSON file fallback."""
+    # Attempt 1: Fetch from GitHub repository API
+    if GITHUB_REPO:
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{CACHE_FILE}?ref={GITHUB_BRANCH}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "TamilNewsBot",
+        }
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+        try:
+            async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    content_b64 = data.get("content", "")
+                    sha = data.get("sha")
+                    decoded_bytes = base64.b64decode(content_b64)
+                    loaded_list = json.loads(decoded_bytes.decode("utf-8"))
+                    urls = set(loaded_list)
+                    logging.info(f"Loaded {len(urls)} cached tweet IDs from GitHub repo ({GITHUB_REPO}) [sha: {sha[:7] if sha else 'none'}]")
+                    # Sync to local cache file as backup
+                    try:
+                        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                            json.dump(sorted(list(urls))[-MAX_CACHE_SIZE:], f, indent=2)
+                    except Exception:
+                        pass
+                    return urls, sha
+                elif resp.status == 404:
+                    logging.info(f"Cache file {CACHE_FILE} not found on GitHub repo, will create upon first post.")
+                    return set(), None
+                else:
+                    logging.warning(f"GitHub API cache fetch returned HTTP {resp.status}, falling back to local file.")
+        except Exception as e:
+            logging.warning(f"Error fetching cache from GitHub API ({e}), falling back to local file.")
+
+    # Attempt 2: Local JSON file fallback
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+                urls = set(json.load(f))
+                logging.info(f"Loaded {len(urls)} cached tweet IDs from local file.")
+                return urls, None
         except Exception as e:
-            logging.error(f"Error reading cache file: {e}")
-    return set()
+            logging.error(f"Error reading local cache file: {e}")
 
-def save_posted_urls(posted_urls: set):
-    """Save seen tweet IDs to local JSON file, keeping max MAX_CACHE_SIZE items deterministically sorted."""
+    return set(), None
+
+async def save_posted_urls(session: aiohttp.ClientSession, posted_urls: set, file_sha: Optional[str] = None):
+    """Save seen tweet IDs to local JSON file and push back to GitHub repository if configured."""
+    sorted_urls = sorted(list(posted_urls))
+    payload_data = sorted_urls[-MAX_CACHE_SIZE:]
+
+    # 1. Local file write
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            sorted_urls = sorted(list(posted_urls))
-            json.dump(sorted_urls[-MAX_CACHE_SIZE:], f, indent=2)
+            json.dump(payload_data, f, indent=2)
     except Exception as e:
-        logging.error(f"Error saving cache file: {e}")
+        logging.error(f"Error saving local cache file: {e}")
+
+    # 2. GitHub repository API commit
+    if GITHUB_TOKEN and GITHUB_REPO:
+        content_str = json.dumps(payload_data, indent=2) + "\n"
+        content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{CACHE_FILE}"
+        headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "TamilNewsBot",
+        }
+
+        # Resolve latest SHA if missing
+        current_sha = file_sha
+        if not current_sha:
+            try:
+                async with session.get(f"{api_url}?ref={GITHUB_BRANCH}", headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        info = await resp.json()
+                        current_sha = info.get("sha")
+            except Exception:
+                pass
+
+        body = {
+            "message": "auto: update posted_tweets.json cache [skip ci]",
+            "content": content_b64,
+            "branch": GITHUB_BRANCH,
+        }
+        if current_sha:
+            body["sha"] = current_sha
+
+        try:
+            async with session.put(api_url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status in (200, 201):
+                    logging.info(f"Successfully committed updated cache to GitHub repo ({GITHUB_REPO})")
+                    return
+                elif resp.status == 409:
+                    # Conflict: re-fetch SHA and retry once
+                    logging.info("Conflict updating GitHub cache; retrying with latest SHA...")
+                    async with session.get(f"{api_url}?ref={GITHUB_BRANCH}", headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as get_resp:
+                        if get_resp.status == 200:
+                            info = await get_resp.json()
+                            body["sha"] = info.get("sha")
+                            async with session.put(api_url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=10)) as retry_resp:
+                                if retry_resp.status in (200, 201):
+                                    logging.info(f"Successfully committed updated cache to GitHub repo on retry ({GITHUB_REPO})")
+                                    return
+                resp_text = await resp.text()
+                logging.warning(f"GitHub API update returned HTTP {resp.status}: {resp_text}")
+        except Exception as e:
+            logging.error(f"Failed to commit updated cache to GitHub: {e}")
 
 async def fetch_tweets_for_account(
     session: aiohttp.ClientSession,
@@ -95,8 +194,12 @@ async def fetch_tweets_for_account(
                             })
                         logging.info(f"Successfully scraped {len(found)} candidate tweets for @{account} from {domain}")
                         return found
+                    else:
+                        logging.info(f"Direct scrape from {domain} for @{account} returned HTTP 200 but found 0 status IDs")
+                else:
+                    logging.info(f"Direct scrape from {domain} for @{account} returned HTTP {response.status}")
         except Exception as e:
-            logging.debug(f"Direct scrape from {domain} for @{account} failed: {e}")
+            logging.info(f"Direct scrape from {domain} for @{account} failed: {e}")
 
     # Strategy 2: Nitter RSS fallback
     for instance in RSS_INSTANCES:
@@ -131,8 +234,12 @@ async def fetch_tweets_for_account(
                             })
                         logging.info(f"Successfully fetched {len(found)} candidate tweets for @{account} from {instance}")
                         return found
+                    else:
+                        logging.info(f"RSS mirror {instance} for @{account} returned 0 valid entries (title: '{title}')")
+                else:
+                    logging.info(f"RSS mirror {instance} for @{account} returned HTTP {response.status}")
         except Exception as e:
-            logging.debug(f"RSS mirror {instance} failed for @{account}: {e}")
+            logging.info(f"RSS mirror {instance} failed for @{account}: {e}")
 
     logging.warning(f"Could not fetch valid tweets for @{account} from any source.")
     return []
@@ -158,13 +265,13 @@ async def main():
         logging.error("DISCORD_WEBHOOK_URL environment variable is missing or invalid.")
         sys.exit(1)
 
-    posted_urls = load_posted_urls()
-    is_first_run = len(posted_urls) == 0
     now = time.time()
-
     all_unposted_tweets = []
 
     async with aiohttp.ClientSession() as session:
+        posted_urls, file_sha = await load_posted_urls(session)
+        is_first_run = len(posted_urls) == 0
+
         # Step 1: FETCH (In parallel using asyncio.gather)
         tasks = [fetch_tweets_for_account(session, account, posted_urls, is_first_run, now) for account in ACCOUNTS]
         results = await asyncio.gather(*tasks)
@@ -197,9 +304,11 @@ async def main():
                 newly_posted += 1
                 await asyncio.sleep(1.5)  # Rate limit protection between webhooks
 
-    if newly_posted > 0:
-        save_posted_urls(posted_urls)
-    logging.info("RSS Feed Monitor execution finished successfully.")
+        if newly_posted > 0:
+            await save_posted_urls(session, posted_urls, file_sha)
+            
+    logging.info("Feed Monitor execution finished successfully.")
 
 if __name__ == "__main__":
     asyncio.run(main())
+

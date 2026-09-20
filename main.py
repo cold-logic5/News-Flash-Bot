@@ -1,7 +1,9 @@
 import os
 import re
+import sys
 import json
 import time
+import calendar
 import asyncio
 import logging
 import aiohttp
@@ -25,9 +27,8 @@ MAX_AGE_SECONDS = 3 * 3600  # Ignore tweets older than 3 hours
 # Working RSS / Nitter mirrors with fallback support
 RSS_INSTANCES = [
     "https://nitter.perennialte.ch",
-    "https://nitter.privacydev.net",
-    "https://nitter.net",
-    "https://xcancel.com",
+    "https://nitter.privacyredirect.com",
+    "https://nitter.poast.org",
 ]
 
 def load_posted_urls() -> set:
@@ -41,10 +42,11 @@ def load_posted_urls() -> set:
     return set()
 
 def save_posted_urls(posted_urls: set):
-    """Save seen tweet IDs to local JSON file, keeping max MAX_CACHE_SIZE items."""
+    """Save seen tweet IDs to local JSON file, keeping max MAX_CACHE_SIZE items deterministically sorted."""
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(posted_urls)[-MAX_CACHE_SIZE:], f, indent=2)
+            sorted_urls = sorted(list(posted_urls))
+            json.dump(sorted_urls[-MAX_CACHE_SIZE:], f, indent=2)
     except Exception as e:
         logging.error(f"Error saving cache file: {e}")
 
@@ -58,7 +60,7 @@ async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
     for instance in RSS_INSTANCES:
         feed_url = f"{instance}/{account}/rss"
         try:
-            async with session.get(feed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            async with session.get(feed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as response:
                 if response.status == 200:
                     content = await response.text()
                     feed = await asyncio.to_thread(feedparser.parse, content)
@@ -92,7 +94,7 @@ async def send_discord_webhook(session: aiohttp.ClientSession, webhook_url: str,
 async def main():
     if not WEBHOOK_URL or WEBHOOK_URL == "YOUR_DISCORD_WEBHOOK_URL_HERE":
         logging.error("DISCORD_WEBHOOK_URL environment variable is missing or invalid.")
-        return
+        sys.exit(1)
 
     posted_urls = load_posted_urls()
     is_first_run = len(posted_urls) == 0
@@ -126,9 +128,9 @@ async def main():
                 if unique_key in posted_urls:
                     continue
 
-                # Parse published timestamp
+                # Parse published timestamp (UTC struct_time -> UTC timestamp)
                 published_parsed = entry.get("published_parsed")
-                published_ts = time.mktime(published_parsed) if published_parsed else now
+                published_ts = calendar.timegm(published_parsed) if published_parsed else now
 
                 # Skip tweets older than MAX_AGE_SECONDS (e.g. 3 hours) except on initial first run
                 if not is_first_run and (now - published_ts > MAX_AGE_SECONDS):
@@ -144,7 +146,6 @@ async def main():
 
         if not all_unposted_tweets:
             logging.info("No new tweets to post.")
-            save_posted_urls(posted_urls)
             return
 
         # Step 2: Sort ALL unposted tweets across all accounts chronologically (oldest first)
@@ -153,6 +154,7 @@ async def main():
         logging.info(f"Found {len(all_unposted_tweets)} new tweets across all accounts. Posting in chronological order...")
 
         # Step 3: Post tweets to Discord in exact chronological sequence
+        newly_posted = 0
         for tweet_info in all_unposted_tweets:
             account = tweet_info["account"]
             tweet_id = tweet_info["tweet_id"]
@@ -164,9 +166,11 @@ async def main():
             success = await send_discord_webhook(session, WEBHOOK_URL, message)
             if success:
                 posted_urls.add(unique_key)
+                newly_posted += 1
                 await asyncio.sleep(1.5)  # Rate limit protection between webhooks
 
-    save_posted_urls(posted_urls)
+    if newly_posted > 0:
+        save_posted_urls(posted_urls)
     logging.info("RSS Feed Monitor execution finished successfully.")
 
 if __name__ == "__main__":

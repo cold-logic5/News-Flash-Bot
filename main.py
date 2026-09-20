@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 load_dotenv()
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-ACCOUNTS_STR = os.getenv("ACCOUNTS", "sunnewstamil,News18TamilNadu,polimernews,NewsTamilTV24x7")
+ACCOUNTS_STR = os.getenv("ACCOUNTS", "sunnewstamil,News18TamilNadu,polimernews")
 ACCOUNTS = [acc.strip() for acc in ACCOUNTS_STR.split(",") if acc.strip()]
 
 CACHE_FILE = "posted_tweets.json"

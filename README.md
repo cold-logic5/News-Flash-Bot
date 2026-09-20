@@ -49,7 +49,7 @@ If hosting on Render:
 Create a `.env` file based on `.env.example`:
 ```env
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-ACCOUNTS=sunnewstamil,News18TamilNadu,polimernews,NewsTamilTV24x7
+ACCOUNTS=sunnewstamil,News18TamilNadu,polimernews
 ```
 
 Run locally:

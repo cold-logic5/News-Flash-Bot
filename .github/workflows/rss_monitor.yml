@@ -31,7 +31,7 @@ jobs:
       - name: Run RSS Feed Monitor
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          ACCOUNTS: ${{ vars.ACCOUNTS || 'sunnewstamil,News18TamilNadu,polimernews,NewsTamilTV24x7' }}
+          ACCOUNTS: ${{ vars.ACCOUNTS || 'sunnewstamil,News18TamilNadu,polimernews' }}
         run: python main.py
 
       - name: Commit and push updated posted_tweets.json cache
